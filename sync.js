@@ -3,6 +3,8 @@
 import puppeteer from 'puppeteer';
 import pixelmatch from 'pixelmatch';
 import { PNG } from 'pngjs';
+import { fileURLToPath } from 'node:url';
+import { stripHot } from './lib/url.js';
 
 // Parse command line arguments
 function parseArgs() {
@@ -13,6 +15,7 @@ function parseArgs() {
     width: 640,
     height: 800,
     diffThreshold: 0.5,
+    diffEnabled: true,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -34,6 +37,7 @@ Options:
   --width, -w <px>     Width of each viewport (default: 640)
   --height <px>        Height of each viewport (default: 800)
   --threshold, -t <n>  Diff sensitivity 0-1 (default: 0.5, higher = less sensitive)
+  --no-diff            Start with the visual pixel diff disabled
   --help, -h           Show this help
 
 Examples:
@@ -55,6 +59,8 @@ Examples:
       config.height = parseInt(args[++i], 10);
     } else if (arg === '--threshold' || arg === '-t') {
       config.diffThreshold = parseFloat(args[++i]);
+    } else if (arg === '--no-diff') {
+      config.diffEnabled = false;
     } else if (!arg.startsWith('-')) {
       // Positional args: first is left/mirror, second is right/control
       if (!config._posCount) config._posCount = 0;
@@ -68,20 +74,11 @@ Examples:
   return config;
 }
 
-const config = parseArgs();
-
-console.log(`
-╔═══════════════════════════════════════════════════════════════╗
-║                   Dual DOM Driver Tool                        ║
-╠═══════════════════════════════════════════════════════════════╣
-║  LEFT  (mirror):  ${config.leftUrl.padEnd(42)} ║
-║  RIGHT (control): ${config.rightUrl.padEnd(42)} ║
-╠═══════════════════════════════════════════════════════════════╣
-║  Interact with EITHER window - the other will mirror actions  ║
-║  Press D to run visual diff | Shift+D to clear overlay        ║
-║  Press Ctrl+C to exit                                         ║
-╚═══════════════════════════════════════════════════════════════╝
-`);
+// Populated by parseArgs() when run as a CLI (see the run-as-main guard at the
+// bottom). Left undefined when this module is imported so that importing it
+// doesn't parse argv, print the banner, or launch a browser. Pure URL helpers
+// live in ./lib/url.js so tests can exercise them without importing puppeteer.
+let config;
 
 async function main() {
   const browser = await puppeteer.launch({
@@ -93,25 +90,37 @@ async function main() {
     ],
   });
 
-  // Create two pages
-  const [leftPage, rightPage] = await Promise.all([
-    browser.newPage(),
-    browser.newPage(),
+  // Separate browser contexts per pane → isolated cookies, localStorage, and
+  // sessionStorage. The rwgps app stores its build pin in sessionStorage["hot"],
+  // which is already per-tab, but giving each window its own context also keeps
+  // cookies/localStorage from crossing — so one pane's session (and hotness)
+  // can never contaminate the other, even when both point at the same origin.
+  const [leftContext, rightContext] = await Promise.all([
+    browser.createBrowserContext(),
+    browser.createBrowserContext(),
   ]);
 
-  // Position windows side by side
-  const leftSession = await leftPage.createCDPSession();
-  const rightSession = await rightPage.createCDPSession();
+  const [leftPage, rightPage] = await Promise.all([
+    leftContext.newPage(),
+    rightContext.newPage(),
+  ]);
 
-  await leftSession.send('Browser.setWindowBounds', {
-    windowId: 1,
-    bounds: { left: 0, top: 0, width: config.width, height: config.height },
-  }).catch(() => {}); // Ignore if not supported
-
-  await rightSession.send('Browser.setWindowBounds', {
-    windowId: 2,
-    bounds: { left: config.width, top: 0, width: config.width, height: config.height },
-  }).catch(() => {});
+  // Position windows side by side. Each context opens its own OS window, so we
+  // resolve the windowId per page rather than assuming fixed ids of 1 and 2.
+  const positionWindow = async (page, left) => {
+    try {
+      const session = await page.createCDPSession();
+      const { windowId } = await session.send('Browser.getWindowForTarget');
+      await session.send('Browser.setWindowBounds', {
+        windowId,
+        bounds: { left, top: 0, width: config.width, height: config.height },
+      });
+    } catch {
+      // Ignore if not supported
+    }
+  };
+  await positionWindow(leftPage, 0);
+  await positionWindow(rightPage, config.width);
 
   // Navigate to initial URLs
   await Promise.all([
@@ -258,8 +267,9 @@ async function main() {
   // Sync lock to prevent infinite loops
   let syncLock = false;
 
-  // Create sync handler for a target page
-  function createSyncHandler(targetPage, sourceUrl, targetUrl) {
+  // Create sync handler for a target page. Navigation is mirrored separately by
+  // the framenavigated handlers (which strip ?hot); this only replays input.
+  function createSyncHandler(targetPage) {
     return async (event) => {
       if (syncLock) return; // Prevent sync loops
       syncLock = true;
@@ -352,11 +362,6 @@ async function main() {
               }
             }, { selector: event.selector, start: event.start, end: event.end });
             break;
-
-          case 'navigate':
-            const newUrl = event.url.replace(sourceUrl, targetUrl);
-            await targetPage.goto(newUrl, { waitUntil: 'domcontentloaded' });
-            break;
         }
       } catch (err) {
         console.log(`[sync error] ${event.type}:`, err.message);
@@ -368,8 +373,8 @@ async function main() {
   }
 
   // Expose sync functions for both directions
-  await rightPage.exposeFunction('syncToOther', createSyncHandler(leftPage, config.rightUrl, config.leftUrl));
-  await leftPage.exposeFunction('syncToOther', createSyncHandler(rightPage, config.leftUrl, config.rightUrl));
+  await rightPage.exposeFunction('syncToOther', createSyncHandler(leftPage));
+  await leftPage.exposeFunction('syncToOther', createSyncHandler(rightPage));
 
   // Inject the event listener script
   const injectScript = `
@@ -774,9 +779,10 @@ async function main() {
     try {
       isNavigating = true;
       const rightUrl = frame.url();
-      const leftUrl = rightUrl.replace(rightOrigin, leftOrigin);
+      // Mirror the clean URL only — never carry ?hot across to the other pane.
+      const leftUrl = stripHot(rightUrl.replace(rightOrigin, leftOrigin));
 
-      if (leftPage.url() !== leftUrl) {
+      if (stripHot(leftPage.url()) !== leftUrl) {
         console.log(`[sync] Navigating left to: ${leftUrl}`);
         await leftPage.goto(leftUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
       }
@@ -798,9 +804,10 @@ async function main() {
     try {
       isNavigating = true;
       const leftUrl = frame.url();
-      const rightUrl = leftUrl.replace(leftOrigin, rightOrigin);
+      // Mirror the clean URL only — never carry ?hot across to the other pane.
+      const rightUrl = stripHot(leftUrl.replace(leftOrigin, rightOrigin));
 
-      if (rightPage.url() !== rightUrl) {
+      if (stripHot(rightPage.url()) !== rightUrl) {
         console.log(`[sync] Navigating right to: ${rightUrl}`);
         await rightPage.goto(rightUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
       }
@@ -842,4 +849,23 @@ async function main() {
   });
 }
 
-main().catch(console.error);
+// Only run the browser-driving tool when executed directly (node sync.js / npm
+// start), not when imported as a module for testing.
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  config = parseArgs();
+
+  console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║                   Dual DOM Driver Tool                        ║
+╠═══════════════════════════════════════════════════════════════╣
+║  LEFT  (mirror):  ${config.leftUrl.padEnd(42)} ║
+║  RIGHT (control): ${config.rightUrl.padEnd(42)} ║
+╠═══════════════════════════════════════════════════════════════╣
+║  Interact with EITHER window - the other will mirror actions  ║
+║  Press D to run visual diff | Shift+D to clear overlay        ║
+║  Press Ctrl+C to exit                                         ║
+╚═══════════════════════════════════════════════════════════════╝
+`);
+
+  main().catch(console.error);
+}

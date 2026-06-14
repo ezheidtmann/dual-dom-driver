@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node sync.js",
-    "help": "node sync.js --help"
+    "help": "node sync.js --help",
+    "test": "node --test"
   },
   "dependencies": {
     "pixelmatch": "^5.3.0",

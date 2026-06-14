@@ -52,5 +52,10 @@ The diff overlay shows:
 - **Green badge**: "No visual differences detected" when pages are identical
 - **Red badge**: Shows count and percentage of differing pixels
 
+### Session Isolation & Hotness
+Each pane runs in its own Puppeteer browser context (`browser.createBrowserContext()`), so cookies, localStorage, and sessionStorage never cross between the two windows. The rwgps app pins its UI build in `sessionStorage["hot"]`, so isolated contexts guarantee one pane's hotness can't contaminate the other — even when both windows point at the same origin.
+
+Navigation mirroring drops the `?hot` param via `stripHot()` before driving the other pane, so the source window's build pin never follows the URL across. (Mirrors the approach in the `tandem` repo's `src/driver.ts`.)
+
 ### CDP Usage
-Wheel events use Chrome DevTools Protocol directly (`Input.dispatchMouseEvent` with `mouseWheel` type) for reliable map zoom behavior.
+Wheel events use Chrome DevTools Protocol directly (`Input.dispatchMouseEvent` with `mouseWheel` type) for reliable map zoom behavior. Window positioning resolves each window's id via `Browser.getWindowForTarget` (each context opens its own OS window) rather than assuming fixed ids.
