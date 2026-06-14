@@ -3,6 +3,8 @@
 import puppeteer from 'puppeteer';
 import pixelmatch from 'pixelmatch';
 import { PNG } from 'pngjs';
+import { fileURLToPath } from 'node:url';
+import { stripHot } from './lib/url.js';
 
 // Parse command line arguments
 function parseArgs() {
@@ -68,35 +70,11 @@ Examples:
   return config;
 }
 
-// Strip hotness params from a URL so the app's build pin (?hot=...) never
-// crosses from one pane to the other when we mirror navigation. The rwgps app
-// reads ?hot into sessionStorage and strips it from the URL itself, so the live
-// URL is normally clean; we defensively drop it here too so each window keeps
-// its own build instead of inheriting the other pane's hotness.
-function stripHot(urlStr) {
-  try {
-    const url = new URL(urlStr);
-    url.searchParams.delete('hot');
-    return url.toString();
-  } catch {
-    return urlStr;
-  }
-}
-
-const config = parseArgs();
-
-console.log(`
-╔═══════════════════════════════════════════════════════════════╗
-║                   Dual DOM Driver Tool                        ║
-╠═══════════════════════════════════════════════════════════════╣
-║  LEFT  (mirror):  ${config.leftUrl.padEnd(42)} ║
-║  RIGHT (control): ${config.rightUrl.padEnd(42)} ║
-╠═══════════════════════════════════════════════════════════════╣
-║  Interact with EITHER window - the other will mirror actions  ║
-║  Press D to run visual diff | Shift+D to clear overlay        ║
-║  Press Ctrl+C to exit                                         ║
-╚═══════════════════════════════════════════════════════════════╝
-`);
+// Populated by parseArgs() when run as a CLI (see the run-as-main guard at the
+// bottom). Left undefined when this module is imported so that importing it
+// doesn't parse argv, print the banner, or launch a browser. Pure URL helpers
+// live in ./lib/url.js so tests can exercise them without importing puppeteer.
+let config;
 
 async function main() {
   const browser = await puppeteer.launch({
@@ -872,4 +850,23 @@ async function main() {
   });
 }
 
-main().catch(console.error);
+// Only run the browser-driving tool when executed directly (node sync.js / npm
+// start), not when imported as a module for testing.
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  config = parseArgs();
+
+  console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║                   Dual DOM Driver Tool                        ║
+╠═══════════════════════════════════════════════════════════════╣
+║  LEFT  (mirror):  ${config.leftUrl.padEnd(42)} ║
+║  RIGHT (control): ${config.rightUrl.padEnd(42)} ║
+╠═══════════════════════════════════════════════════════════════╣
+║  Interact with EITHER window - the other will mirror actions  ║
+║  Press D to run visual diff | Shift+D to clear overlay        ║
+║  Press Ctrl+C to exit                                         ║
+╚═══════════════════════════════════════════════════════════════╝
+`);
+
+  main().catch(console.error);
+}
