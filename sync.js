@@ -68,6 +68,21 @@ Examples:
   return config;
 }
 
+// Strip hotness params from a URL so the app's build pin (?hot=...) never
+// crosses from one pane to the other when we mirror navigation. The rwgps app
+// reads ?hot into sessionStorage and strips it from the URL itself, so the live
+// URL is normally clean; we defensively drop it here too so each window keeps
+// its own build instead of inheriting the other pane's hotness.
+function stripHot(urlStr) {
+  try {
+    const url = new URL(urlStr);
+    url.searchParams.delete('hot');
+    return url.toString();
+  } catch {
+    return urlStr;
+  }
+}
+
 const config = parseArgs();
 
 console.log(`
@@ -93,25 +108,37 @@ async function main() {
     ],
   });
 
-  // Create two pages
-  const [leftPage, rightPage] = await Promise.all([
-    browser.newPage(),
-    browser.newPage(),
+  // Separate browser contexts per pane → isolated cookies, localStorage, and
+  // sessionStorage. The rwgps app stores its build pin in sessionStorage["hot"],
+  // which is already per-tab, but giving each window its own context also keeps
+  // cookies/localStorage from crossing — so one pane's session (and hotness)
+  // can never contaminate the other, even when both point at the same origin.
+  const [leftContext, rightContext] = await Promise.all([
+    browser.createBrowserContext(),
+    browser.createBrowserContext(),
   ]);
 
-  // Position windows side by side
-  const leftSession = await leftPage.createCDPSession();
-  const rightSession = await rightPage.createCDPSession();
+  const [leftPage, rightPage] = await Promise.all([
+    leftContext.newPage(),
+    rightContext.newPage(),
+  ]);
 
-  await leftSession.send('Browser.setWindowBounds', {
-    windowId: 1,
-    bounds: { left: 0, top: 0, width: config.width, height: config.height },
-  }).catch(() => {}); // Ignore if not supported
-
-  await rightSession.send('Browser.setWindowBounds', {
-    windowId: 2,
-    bounds: { left: config.width, top: 0, width: config.width, height: config.height },
-  }).catch(() => {});
+  // Position windows side by side. Each context opens its own OS window, so we
+  // resolve the windowId per page rather than assuming fixed ids of 1 and 2.
+  const positionWindow = async (page, left) => {
+    try {
+      const session = await page.createCDPSession();
+      const { windowId } = await session.send('Browser.getWindowForTarget');
+      await session.send('Browser.setWindowBounds', {
+        windowId,
+        bounds: { left, top: 0, width: config.width, height: config.height },
+      });
+    } catch {
+      // Ignore if not supported
+    }
+  };
+  await positionWindow(leftPage, 0);
+  await positionWindow(rightPage, config.width);
 
   // Navigate to initial URLs
   await Promise.all([
@@ -354,7 +381,8 @@ async function main() {
             break;
 
           case 'navigate':
-            const newUrl = event.url.replace(sourceUrl, targetUrl);
+            // Drop ?hot so the source pane's build pin doesn't follow the URL.
+            const newUrl = stripHot(event.url.replace(sourceUrl, targetUrl));
             await targetPage.goto(newUrl, { waitUntil: 'domcontentloaded' });
             break;
         }
@@ -774,9 +802,10 @@ async function main() {
     try {
       isNavigating = true;
       const rightUrl = frame.url();
-      const leftUrl = rightUrl.replace(rightOrigin, leftOrigin);
+      // Mirror the clean URL only — never carry ?hot across to the other pane.
+      const leftUrl = stripHot(rightUrl.replace(rightOrigin, leftOrigin));
 
-      if (leftPage.url() !== leftUrl) {
+      if (stripHot(leftPage.url()) !== leftUrl) {
         console.log(`[sync] Navigating left to: ${leftUrl}`);
         await leftPage.goto(leftUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
       }
@@ -798,9 +827,10 @@ async function main() {
     try {
       isNavigating = true;
       const leftUrl = frame.url();
-      const rightUrl = leftUrl.replace(leftOrigin, rightOrigin);
+      // Mirror the clean URL only — never carry ?hot across to the other pane.
+      const rightUrl = stripHot(leftUrl.replace(leftOrigin, rightOrigin));
 
-      if (rightPage.url() !== rightUrl) {
+      if (stripHot(rightPage.url()) !== rightUrl) {
         console.log(`[sync] Navigating right to: ${rightUrl}`);
         await rightPage.goto(rightUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
       }
