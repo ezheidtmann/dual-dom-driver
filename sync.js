@@ -15,6 +15,7 @@ function parseArgs() {
     width: 640,
     height: 800,
     diffThreshold: 0.5,
+    diffEnabled: true,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -36,6 +37,7 @@ Options:
   --width, -w <px>     Width of each viewport (default: 640)
   --height <px>        Height of each viewport (default: 800)
   --threshold, -t <n>  Diff sensitivity 0-1 (default: 0.5, higher = less sensitive)
+  --no-diff            Start with the visual pixel diff disabled
   --help, -h           Show this help
 
 Examples:
@@ -57,6 +59,8 @@ Examples:
       config.height = parseInt(args[++i], 10);
     } else if (arg === '--threshold' || arg === '-t') {
       config.diffThreshold = parseFloat(args[++i]);
+    } else if (arg === '--no-diff') {
+      config.diffEnabled = false;
     } else if (!arg.startsWith('-')) {
       // Positional args: first is left/mirror, second is right/control
       if (!config._posCount) config._posCount = 0;
@@ -263,8 +267,9 @@ async function main() {
   // Sync lock to prevent infinite loops
   let syncLock = false;
 
-  // Create sync handler for a target page
-  function createSyncHandler(targetPage, sourceUrl, targetUrl) {
+  // Create sync handler for a target page. Navigation is mirrored separately by
+  // the framenavigated handlers (which strip ?hot); this only replays input.
+  function createSyncHandler(targetPage) {
     return async (event) => {
       if (syncLock) return; // Prevent sync loops
       syncLock = true;
@@ -357,12 +362,6 @@ async function main() {
               }
             }, { selector: event.selector, start: event.start, end: event.end });
             break;
-
-          case 'navigate':
-            // Drop ?hot so the source pane's build pin doesn't follow the URL.
-            const newUrl = stripHot(event.url.replace(sourceUrl, targetUrl));
-            await targetPage.goto(newUrl, { waitUntil: 'domcontentloaded' });
-            break;
         }
       } catch (err) {
         console.log(`[sync error] ${event.type}:`, err.message);
@@ -374,8 +373,8 @@ async function main() {
   }
 
   // Expose sync functions for both directions
-  await rightPage.exposeFunction('syncToOther', createSyncHandler(leftPage, config.rightUrl, config.leftUrl));
-  await leftPage.exposeFunction('syncToOther', createSyncHandler(rightPage, config.leftUrl, config.rightUrl));
+  await rightPage.exposeFunction('syncToOther', createSyncHandler(leftPage));
+  await leftPage.exposeFunction('syncToOther', createSyncHandler(rightPage));
 
   // Inject the event listener script
   const injectScript = `
